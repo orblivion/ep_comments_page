@@ -29,6 +29,19 @@ exports.padCopy = async (hookName, context) => {
   ]);
 };
 
+// This is in addition to `handleCommentMessageSecurity`, and only applies to
+// normal etherpad events that are used for comments.
+//
+// For instance, when a user adds a comment, the front end will fire off an
+// event to attach the comment attribute to the selected text. That is handled
+// by etherpad's normal security flow, and handleMessageSecurity here can
+// optionally override a read-only block.
+//
+// However the front end will fire off a *separate* event that will actually
+// add the comment to the database in the handlers below. Those events are
+// *not* part of etherpad's normal security flow (because it's an indpendent
+// socket connection), and as such need to call handleCommentMessageSecurity to
+// fully handle the security concerns here.
 exports.handleMessageSecurity = async (hookName, {message, client: socket}) => {
   const {type: mtype, data: {type: dtype, apool, changeset} = {}} = message;
   if (mtype !== 'COLLABROOM') return;
@@ -55,6 +68,50 @@ exports.handleMessageSecurity = async (hookName, {message, client: socket}) => {
   }
   return true;
 };
+
+// TODO - handle hiding/showing the comment interface elements stuff based on permission, in the static js
+
+const handleCommentMessageSecurity = (socket, padId) => {
+  const access = (() => {
+    const user = socket.client.request.session.user; // TODO - no such thing
+    const userAuthorization = user.padAuthorizations && user.padAuthorizations[padId]
+
+    if (!userAuthorization || userAuthorization === 'none') {
+      // the user doesn't have access to the pad
+      return false;
+    }
+    if (userAuthorization === 'modify' || userAuthorization === 'create') {
+      // the user can edit the pad, so they can certainly comment
+      return true;
+    }
+
+    const userCommentsSettings = user.username in settings.users ? settings.users[user.username].ep_comments_page : {}
+
+    if (userCommentsSettings.perPadCanComment && padId in userCommentsSettings.perPadCanComment) {
+      // If there's a per-user, per-pad setting, go with that
+      return userCommentsSettings.perPadCanComment[padId]
+    }
+    if ('canComment' in userCommentsSettings) {
+      // If there's a per-user setting, go with that
+      return userCommentsSettings.canComment
+    }
+    if (settings.ep_comments_page && 'readOnlyCanComment' in settings.ep_comments_page) {
+      // If there's a global setting, go with that
+      return settings.ep_comments_page.readOnlyCanComment
+    }
+
+    // readOnlyCanComment is true by default. If it's missing and we got this far.
+    return true;
+  })()
+
+  // The UI should not be offering users a way to send these messages. If it is
+  // sent, assume this is an attacker and shut off the connection to avoid a
+  // DOS.
+  if (!access) {
+    socket.close()
+  }
+  return access
+}
 
 exports.socketio = (hookName, args, cb) => {
   io = args.io.of('/comment');
@@ -83,6 +140,13 @@ exports.socketio = (hookName, args, cb) => {
     // On add events
     socket.on('addComment', handler(async (data) => {
       const {padId} = await readOnlyManager.getIds(data.padId);
+
+      // TODO - is readOnlyManager going to kick any of the wrong people out?
+      // TODO - is readOnlyManager going to kick out people without read access already, making it unnecessary above?
+      if (!handleCommentMessageSecurity(socket, padId)){
+        return
+      }
+
       const content = data.comment;
       const [commentId, comment] = await commentManager.addComment(padId, content);
       if (commentId != null && comment != null) {
